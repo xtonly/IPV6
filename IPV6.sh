@@ -30,7 +30,7 @@ reload_network() {
     sleep 4
 }
 
-# ================== 状态检测 & Check.Place 融合 ==================
+# ================== 基础状态检测 (本地极速) ==================
 check_status() {
     local status=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
     local has_inet6=$(ip a | grep -w inet6)
@@ -53,9 +53,15 @@ check_status() {
         echo -e "网卡接口层状态  : ${GREEN}已分配 IPv6 栈 (至少具备 fe80 本地链路)${RESET}"
     fi
     echo -e "${CYAN}=========================================================${RESET}"
-    
-    # 融合 Check.Place 核心库进行精准检测
-    echo -e "${YELLOW}正在调用 Check.Place 数据库进行高精度 IP 属性检测，请稍候...${RESET}"
+}
+
+# ================== Check.Place 详细检测 ==================
+run_check_place() {
+    clear
+    echo -e "${CYAN}=========================================================${RESET}"
+    echo -e "${YELLOW}正在调用 Check.Place 数据库进行高精度 IP 属性检测...${RESET}"
+    echo -e "${YELLOW}由于需要拉取多个商业数据库，请耐心等待几秒钟。${RESET}"
+    echo -e "${CYAN}=========================================================${RESET}"
     
     # 执行原生检测命令，只输出基础信息面板(-I)
     bash <(curl -Ls https://Check.Place) -I
@@ -76,7 +82,6 @@ enable_ipv6() {
     
     reload_network
     echo -e "${GREEN}系统级 IPv6 启用流程完毕！${RESET}\n"
-    read -n 1 -s -r -p "按任意键刷新面板以查看最新 IP 状态..."
 }
 
 disable_ipv6() {
@@ -97,7 +102,6 @@ EOF
     sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1
     sysctl -p >/dev/null 2>&1
     echo -e "${GREEN}系统级 IPv6 已成功禁用！所有网卡已关闭 IPv6 协议栈。${RESET}\n"
-    read -n 1 -s -r -p "按任意键刷新面板..."
 }
 
 # ================== 交互菜单 ==================
@@ -107,14 +111,31 @@ while true; do
     
     echo "  1. 启用 IPv6 (Enable)"
     echo "  2. 禁用 IPv6 (Disable)"
+    echo "  3. 运行详细 IP 检测 (Check.Place)"
     echo "  0. 退出脚本"
     echo -e "${CYAN}=========================================================${RESET}"
     read -p "请输入对应的数字选项: " choice
 
     case "$choice" in
-        1) enable_ipv6 ;;
-        2) disable_ipv6 ;;
-        0) echo -e "已退出脚本。"; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新输入！${RESET}"; sleep 1 ;;
+        1) 
+            enable_ipv6
+            read -n 1 -s -r -p "按任意键返回主菜单..." 
+            ;;
+        2) 
+            disable_ipv6
+            read -n 1 -s -r -p "按任意键返回主菜单..." 
+            ;;
+        3) 
+            run_check_place
+            read -n 1 -s -r -p "按任意键返回主菜单..." 
+            ;;
+        0) 
+            echo -e "已退出脚本。"
+            exit 0 
+            ;;
+        *) 
+            echo -e "${RED}无效选项，请重新输入！${RESET}"
+            sleep 1 
+            ;;
     esac
 done
