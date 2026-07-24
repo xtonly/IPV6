@@ -30,7 +30,7 @@ reload_network() {
     sleep 4
 }
 
-# ================== IP 详情检测 (双栈) ==================
+# ================== 高精度 IP 详情检测 (Maxmind + IPinfo) ==================
 check_ip_info() {
     local version=$1
     local ip
@@ -49,46 +49,77 @@ check_ip_info() {
     fi
 
     echo -e "公网 IP 地址   : ${GREEN}${ip}${RESET}"
+    echo -en "正在查询 Maxmind & IPinfo 数据库以进行精准比对...\r"
 
-    # 请求 ip-api.com 获取 Geo 使用地及 ASN (强制用 v4 请求避免路由未通卡死)
-    local geo_api="http://ip-api.com/json/${ip}?fields=country,countryCode,city,isp,org,as,hosting"
-    local geo_res=$(curl -s -4 --max-time 5 "$geo_api")
+    # 使用 IP.SB (纯正 Maxmind GeoIP 数据库) 获取使用地
+    local geo_res=$(curl -s -4 --max-time 5 "https://api.ip.sb/geoip/${ip}")
     
-    # 请求 ipinfo.io 获取 Whois 注册地
-    local whois_api="https://ipinfo.io/${ip}/json"
-    local whois_res=$(curl -s -4 --max-time 5 "$whois_api")
+    # 使用 IPinfo 获取真实的 Whois 注册地和公司属性
+    local whois_res=$(curl -s -4 --max-time 5 "https://ipinfo.io/${ip}/json")
+
+    # 清除上一行的提示
+    echo -e "\033[2K\r\c"
 
     if [[ -n "$geo_res" ]]; then
+        # 解析 Maxmind (ip.sb)
         local usage_country=$(echo "$geo_res" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
-        local usage_code=$(echo "$geo_res" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
-        local isp=$(echo "$geo_res" | grep -o '"isp":"[^"]*"' | cut -d'"' -f4)
-        local as_info=$(echo "$geo_res" | grep -o '"as":"[^"]*"' | cut -d'"' -f4)
-        local hosting=$(echo "$geo_res" | grep -o '"hosting":true\|"hosting":false' | cut -d':' -f2)
-
+        local usage_code=$(echo "$geo_res" | grep -o '"country_code":"[^"]*"' | cut -d'"' -f4)
+        local asn=$(echo "$geo_res" | grep -o '"asn":[^,]*' | cut -d':' -f2 | tr -d ' ')
+        
+        # 解析 IPinfo
+        local org=$(echo "$whois_res" | grep -o '"org": "[^"]*"' | cut -d'"' -f4 | cut -d' ' -f2-)
         local reg_code=$(echo "$whois_res" | grep -o '"country": "[^"]*"' | cut -d'"' -f4)
-        # 如果获取失败则 fallback 回使用地代码
+        local hosting=$(echo "$whois_res" | grep -o '"hosting": true\|"hosting": false' | cut -d' ' -f2)
+
+        # 容错处理
+        [[ -z "$org" ]] && org=$(echo "$geo_res" | grep -o '"organization":"[^"]*"' | cut -d'"' -f4)
         [[ -z "$reg_code" ]] && reg_code="$usage_code"
+        
+        echo -e "自治系统 (ASN) : ${CYAN}AS${asn} ${org}${RESET}"
+        
+        # 常见国家名称汉化
+        local usage_cn="$usage_country"
+        [[ "$usage_code" == "CN" ]] && usage_cn="中国"
+        [[ "$usage_code" == "SG" ]] && usage_cn="新加坡"
+        [[ "$usage_code" == "US" ]] && usage_cn="美国"
+        [[ "$usage_code" == "GB" ]] && usage_cn="英国"
+        [[ "$usage_code" == "HK" ]] && usage_cn="香港"
+        [[ "$usage_code" == "JP" ]] && usage_cn="日本"
+        [[ "$usage_code" == "TW" ]] && usage_cn="台湾"
+        
+        local reg_cn=""
+        [[ "$reg_code" == "CN" ]] && reg_cn="中国"
+        [[ "$reg_code" == "SG" ]] && reg_cn="新加坡"
+        [[ "$reg_code" == "US" ]] && reg_cn="美国"
+        [[ "$reg_code" == "GB" ]] && reg_cn="英国"
+        [[ "$reg_code" == "HK" ]] && reg_cn="香港"
+        [[ "$reg_code" == "JP" ]] && reg_cn="日本"
+        [[ "$reg_code" == "TW" ]] && reg_cn="台湾"
 
-        echo -e "自治系统 (ASN) : ${CYAN}${as_info}${RESET}"
-        echo -e "组织 / ISP     : ${CYAN}${isp}${RESET}"
-        echo -e "使用地 (Geo)   : ${CYAN}[${usage_code}] ${usage_country}${RESET}"
-        echo -e "注册地 (Whois) : ${CYAN}[${reg_code}]${RESET}"
+        # 打印比对结果
+        echo -e "使用地 (Geo)   : ${CYAN}[${usage_code}] ${usage_cn}${RESET} (Maxmind)"
+        
+        if [[ -n "$reg_cn" ]]; then
+            echo -e "注册地 (Whois) : ${CYAN}[${reg_code}] ${reg_cn}${RESET} (IPinfo)"
+        else
+            echo -e "注册地 (Whois) : ${CYAN}[${reg_code}]${RESET} (IPinfo)"
+        fi
 
-        # 核心逻辑：如果使用地与注册地一致为原生，不一致为广播
+        # 核心判定逻辑：使用地与注册地一致即为原生
         if [[ "$usage_code" == "$reg_code" ]]; then
             echo -e "IP 路由类型    : ${GREEN}原生 IP (Native)${RESET}"
         else
             echo -e "IP 路由类型    : ${RED}广播 IP (Broadcast)${RESET}"
         fi
         
-        # 补充：机房与家用宽带区分
-        if [[ "$hosting" == "true" ]]; then
-            echo -e "IP 业务属性    : ${YELLOW}数据中心/机房 (Hosting)${RESET}"
+        # 业务属性判定 (综合 IPinfo 标记与常见机房关键字)
+        if [[ "$hosting" == "true" || -n $(echo "$org" | grep -i "cloud\|hosting\|datacenter\|datawave\|ocean\|alibaba\|tencent") ]]; then
+            echo -e "IP 业务属性    : ${YELLOW}数据中心 / 机房 (Hosting)${RESET}"
         else
-            echo -e "IP 业务属性    : ${GREEN}住宅/商业宽带 (Residential/ISP)${RESET}"
+            echo -e "IP 业务属性    : ${GREEN}住宅 / 商业宽带 (Residential/ISP)${RESET}"
         fi
     else
-        echo -e "${RED}无法获取归属地详情，API 请求超时或限流。${RESET}"
+        echo -e "${RED}无法获取详细归属地信息，请检查 VPS 对外访问网络。${RESET}"
     fi
 }
 
@@ -115,10 +146,9 @@ check_status() {
         echo -e "网卡接口层状态  : ${GREEN}已分配 IPv6 栈 (至少具备 fe80 本地链路)${RESET}"
     fi
     
-    # 无论 IPv6 状态如何，始终显示 IPv4
+    # 强制分别检测 IPv4 和 IPv6，排版清晰
     check_ip_info "4"
     
-    # 仅当系统启用了 IPv6 且网卡挂载了协议栈时，检测 IPv6
     if [[ "$status" == "0" ]] && [[ -n "$has_inet6" ]]; then
         check_ip_info "6"
     fi
