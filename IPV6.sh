@@ -42,33 +42,34 @@ fetch_ip_details() {
     fi
     echo -e "公网 IP 地址   : ${GREEN}${ip}${RESET}"
     
-    # 彻底抛弃易被限流的单一接口，组合使用 ip-api(Geo) 和 ipinfo(Whois)
-    local geo_api="http://ip-api.com/json/${ip}?fields=country,countryCode,isp,org,as,hosting"
+    # 采用黄金组合: ip.sb (Maxmind) + ipinfo.io (最强 Whois 库)
+    local geo_api="https://api.ip.sb/geoip/${ip}"
     local whois_api="https://ipinfo.io/${ip}/json"
     
-    local geo_data=$(curl -s -4 --max-time 3 "$geo_api")
-    local whois_data=$(curl -s -4 --max-time 3 "$whois_api")
+    # 强制用 IPv4 发起请求防止 V6 路由黑洞，加上 User-Agent 伪装防止防火墙拦截
+    local geo_data=$(curl -s -4 --max-time 4 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "$geo_api")
+    local whois_data=$(curl -s -4 --max-time 4 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "$whois_api")
     
     if [[ -z "$geo_data" && -z "$whois_data" ]]; then
         echo -e "${RED}数据查询超时或被网络拦截，无法获取详细归属地。${RESET}"
         return
     fi
 
-    # 轻量解析 Geo 数据 (ip-api)
-    local usage_code=$(echo "$geo_data" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
-    local usage_country=$(echo "$geo_data" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
-    local asn_info=$(echo "$geo_data" | grep -o '"as":"[^"]*"' | cut -d'"' -f4)
-    local is_dc=$(echo "$geo_data" | grep -o '"hosting":true\|"hosting":false' | cut -d':' -f2)
+    # 解析 Whois (ipinfo) 获取精确的 ASN 和 注册地
+    local reg_code=$(echo "$whois_data" | grep -o '"country": "[^"]*"' | cut -d'"' -f4 | head -n 1)
+    # ipinfo 的 org 字段非常标准，例如 "AS142433 Datawave Global LLC"
+    local asn_info=$(echo "$whois_data" | grep -o '"org": "[^"]*"' | cut -d'"' -f4 | head -n 1)
+    local is_dc=$(echo "$whois_data" | grep -o '"hosting": true\|"hosting": false' | cut -d' ' -f2 | head -n 1)
 
-    # 轻量解析 Whois 数据 (ipinfo)
-    local reg_code=$(echo "$whois_data" | grep -o '"country": "[^"]*"' | cut -d'"' -f4)
-    local org=$(echo "$whois_data" | grep -o '"org": "[^"]*"' | cut -d'"' -f4 | cut -d' ' -f2-)
+    # 解析 Geo (ip.sb / Maxmind) 获取使用地
+    local usage_code=$(echo "$geo_data" | grep -o '"country_code":"[^"]*"' | cut -d'"' -f4 | head -n 1)
+    local usage_country=$(echo "$geo_data" | grep -o '"country":"[^"]*"' | cut -d'"' -f4 | head -n 1)
 
     # 数据容错互补
     [[ -z "$usage_code" ]] && usage_code="$reg_code"
     [[ -z "$reg_code" ]] && reg_code="$usage_code"
     [[ -z "$usage_country" ]] && usage_country="$usage_code"
-    [[ -z "$asn_info" ]] && asn_info=$(echo "$whois_data" | grep -o '"org": "[^"]*"' | cut -d'"' -f4)
+    [[ -z "$asn_info" ]] && asn_info=$(echo "$geo_data" | grep -o '"organization":"[^"]*"' | cut -d'"' -f4 | head -n 1)
 
     # 常见地区简易汉化
     [[ "$usage_code" == "CN" ]] && usage_country="中国"
@@ -91,7 +92,7 @@ fetch_ip_details() {
     fi
     
     # 业务属性判定
-    if [[ "$is_dc" == "true" || -n $(echo "${asn_info}${org}" | grep -i "cloud\|hosting\|datacenter\|datawave") ]]; then
+    if [[ "$is_dc" == "true" || -n $(echo "${asn_info}" | grep -i "cloud\|hosting\|datacenter\|datawave") ]]; then
         echo -e "IP 业务属性    : ${YELLOW}数据中心 / 机房 (Hosting)${RESET}"
     else
         echo -e "IP 业务属性    : ${GREEN}住宅 / 商业宽带 (Residential/ISP)${RESET}"
@@ -123,11 +124,11 @@ check_status() {
     
     echo -en "正在极速获取 IP 属性分析...\r"
     
-    local public_ipv4=$(curl -s -4 --max-time 2 http://icanhazip.com || curl -s -4 --max-time 2 http://ifconfig.me/ip)
+    local public_ipv4=$(curl -s -4 --max-time 2 -A "Mozilla/5.0" http://icanhazip.com || curl -s -4 --max-time 2 -A "Mozilla/5.0" http://ifconfig.me/ip)
     local public_ipv6=""
     
     if [[ "$status" == "0" ]] && [[ -n "$has_inet6" ]]; then
-        public_ipv6=$(curl -s -6 --max-time 2 http://icanhazip.com || curl -s -6 --max-time 2 http://ifconfig.co/ip)
+        public_ipv6=$(curl -s -6 --max-time 2 -A "Mozilla/5.0" http://icanhazip.com || curl -s -6 --max-time 2 -A "Mozilla/5.0" http://ifconfig.co/ip)
     fi
 
     echo -e "\033[2K\r\c"
