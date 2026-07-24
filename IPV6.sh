@@ -30,7 +30,74 @@ reload_network() {
     sleep 4
 }
 
-# ================== 基础状态检测 (本地极速) ==================
+# ================== 极速高精度 IP 属性检测 ==================
+fetch_ip_details() {
+    local version=$1
+    local ip=$2
+    
+    echo -e "\n${CYAN}--- IPv${version} 网络状态 ---${RESET}"
+    if [[ -z "$ip" ]]; then
+        echo -e "公网状态       : ${YELLOW}未获取到公网 IP (请检查路由或网络配置)${RESET}"
+        return
+    fi
+    echo -e "公网 IP 地址   : ${GREEN}${ip}${RESET}"
+    
+    # 极速调用专业商业接口，直接分离 Geo(使用地) 和 Whois(注册地)
+    local api_url="https://api.ipapi.is/?q=${ip}"
+    local ip_data
+    
+    if [[ "$version" == "4" ]]; then
+        ip_data=$(curl -s -4 --max-time 3 "$api_url")
+    else
+        ip_data=$(curl -s -6 --max-time 3 "$api_url")
+    fi
+    
+    if [[ -z "$ip_data" || "$ip_data" == *"error"* ]]; then
+        echo -e "${RED}数据查询超时或被限流，无法获取详细归属地。${RESET}"
+        return
+    fi
+
+    # 轻量级文本解析，摆脱依赖
+    local usage_code=$(echo "$ip_data" | grep -A 5 '"location":' | grep -o '"country_code": "[^"]*"' | cut -d'"' -f4 | head -n 1)
+    local usage_country=$(echo "$ip_data" | grep -A 5 '"location":' | grep -o '"country": "[^"]*"' | cut -d'"' -f4 | head -n 1)
+    
+    local reg_code=$(echo "$ip_data" | grep -A 5 '"asn":' | grep -o '"country": "[^"]*"' | cut -d'"' -f4 | tr '[:lower:]' '[:upper:]' | head -n 1)
+    local asn_num=$(echo "$ip_data" | grep -A 5 '"asn":' | grep -o '"asn": [0-9]*' | cut -d' ' -f2 | head -n 1)
+    local org=$(echo "$ip_data" | grep -A 5 '"company":' | grep -o '"name": "[^"]*"' | cut -d'"' -f4 | head -n 1)
+    local is_dc=$(echo "$ip_data" | grep -o '"is_datacenter": \(true\|false\)' | cut -d' ' -f2 | head -n 1)
+
+    [[ -z "$reg_code" ]] && reg_code="$usage_code"
+    [[ -z "$usage_country" ]] && usage_country="$usage_code"
+
+    # 常见地区简易汉化
+    [[ "$usage_code" == "CN" ]] && usage_country="中国"
+    [[ "$usage_code" == "SG" ]] && usage_country="新加坡"
+    [[ "$usage_code" == "US" ]] && usage_country="美国"
+    [[ "$usage_code" == "GB" ]] && usage_country="英国"
+    [[ "$usage_code" == "HK" ]] && usage_country="香港"
+    [[ "$usage_code" == "JP" ]] && usage_country="日本"
+    [[ "$usage_code" == "TW" ]] && usage_country="台湾"
+
+    echo -e "自治系统 (ASN) : ${CYAN}AS${asn_num} ${org}${RESET}"
+    echo -e "使用地 (Geo)   : ${CYAN}[${usage_code}] ${usage_country}${RESET}"
+    echo -e "注册地 (Whois) : ${CYAN}[${reg_code}]${RESET}"
+
+    # 核心判定：使用地与注册地一致即为原生，不一致即为广播
+    if [[ "$usage_code" == "$reg_code" ]]; then
+        echo -e "IP 路由类型    : ${GREEN}原生 IP (Native)${RESET}"
+    else
+        echo -e "IP 路由类型    : ${RED}广播 IP (Broadcast)${RESET}"
+    fi
+    
+    # 业务属性判定
+    if [[ "$is_dc" == "true" || -n $(echo "$org" | grep -i "cloud\|hosting\|datacenter\|datawave") ]]; then
+        echo -e "IP 业务属性    : ${YELLOW}数据中心 / 机房 (Hosting)${RESET}"
+    else
+        echo -e "IP 业务属性    : ${GREEN}住宅 / 商业宽带 (Residential/ISP)${RESET}"
+    fi
+}
+
+# ================== 基础状态与 IP 显示 ==================
 check_status() {
     local status=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
     local has_inet6=$(ip a | grep -w inet6)
@@ -52,20 +119,25 @@ check_status() {
     else
         echo -e "网卡接口层状态  : ${GREEN}已分配 IPv6 栈 (至少具备 fe80 本地链路)${RESET}"
     fi
-    echo -e "${CYAN}=========================================================${RESET}"
-}
+    
+    echo -en "正在极速获取 IP 属性分析...\r"
+    
+    local public_ipv4=$(curl -s -4 --max-time 2 http://icanhazip.com || curl -s -4 --max-time 2 http://ifconfig.me/ip)
+    local public_ipv6=""
+    
+    if [[ "$status" == "0" ]] && [[ -n "$has_inet6" ]]; then
+        public_ipv6=$(curl -s -6 --max-time 2 http://icanhazip.com || curl -s -6 --max-time 2 http://ifconfig.co/ip)
+    fi
 
-# ================== Check.Place 详细检测 ==================
-run_check_place() {
-    clear
-    echo -e "${CYAN}=========================================================${RESET}"
-    echo -e "${YELLOW}正在调用 Check.Place 数据库进行高精度 IP 属性检测...${RESET}"
-    echo -e "${YELLOW}由于需要拉取多个商业数据库，请耐心等待几秒钟。${RESET}"
-    echo -e "${CYAN}=========================================================${RESET}"
+    echo -e "\033[2K\r\c"
+
+    # 执行详情获取
+    fetch_ip_details "4" "$public_ipv4"
     
-    # 执行原生检测命令，只输出基础信息面板(-I)
-    bash <(curl -Ls https://Check.Place) -I
-    
+    if [[ "$status" == "0" ]] && [[ -n "$has_inet6" ]]; then
+        fetch_ip_details "6" "$public_ipv6"
+    fi
+
     echo -e "${CYAN}=========================================================${RESET}"
 }
 
@@ -111,7 +183,6 @@ while true; do
     
     echo "  1. 启用 IPv6 (Enable)"
     echo "  2. 禁用 IPv6 (Disable)"
-    echo "  3. 运行详细 IP 检测 (Check.Place)"
     echo "  0. 退出脚本"
     echo -e "${CYAN}=========================================================${RESET}"
     read -p "请输入对应的数字选项: " choice
@@ -119,15 +190,11 @@ while true; do
     case "$choice" in
         1) 
             enable_ipv6
-            read -n 1 -s -r -p "按任意键返回主菜单..." 
+            read -n 1 -s -r -p "按任意键返回主菜单刷新状态..." 
             ;;
         2) 
             disable_ipv6
-            read -n 1 -s -r -p "按任意键返回主菜单..." 
-            ;;
-        3) 
-            run_check_place
-            read -n 1 -s -r -p "按任意键返回主菜单..." 
+            read -n 1 -s -r -p "按任意键返回主菜单刷新状态..." 
             ;;
         0) 
             echo -e "已退出脚本。"
