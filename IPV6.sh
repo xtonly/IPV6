@@ -12,17 +12,37 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# ================== 网络重载模块 ==================
+reload_network() {
+    echo -e "${YELLOW}--> 正在尝试重载网络服务以触发 IPv6 地址分配...${RESET}"
+    
+    # 按照常见优先级检测并重启网络服务
+    if command -v netplan >/dev/null 2>&1; then
+        netplan apply >/dev/null 2>&1
+    elif systemctl is-active --quiet systemd-networkd; then
+        systemctl restart systemd-networkd >/dev/null 2>&1
+    elif systemctl is-active --quiet networking; then
+        systemctl restart networking >/dev/null 2>&1
+    elif systemctl is-active --quiet NetworkManager; then
+        systemctl restart NetworkManager >/dev/null 2>&1
+    else
+        echo -e "${YELLOW}未检测到标准网络重载工具，如果未获取到 IPv6，可能需要手动执行 systemctl restart network${RESET}"
+    fi
+    
+    # 给系统留出 4 秒钟的时间完成 SLAAC 或 DHCPv6 协商
+    echo -e "正在等待网卡完成 IP 协商 (约 4 秒)..."
+    sleep 4
+}
+
 # ================== IP 详情检测 ==================
 check_ipv6_info() {
     echo -e "${CYAN}---------------------------------------------------------${RESET}"
-    # 打印提示信息，不换行，方便后续用 ANSI 码清除
     echo -en "正在检测公网 IPv6 详情 (请稍候)...\r"
     
     local ipv6
-    # 增加备用接口，提高稳定性
     ipv6=$(curl -s -6 --max-time 3 http://icanhazip.com || curl -s -6 --max-time 3 http://ifconfig.co/ip)
     
-    # 清除上一行的"正在检测..."提示，保持界面整洁 (利用 \2K 清除当前行)
+    # 清除上一行的提示
     echo -e "\033[2K\r\c"
 
     if [[ -z "$ipv6" ]]; then
@@ -32,13 +52,11 @@ check_ipv6_info() {
 
     echo -e "公网 IPv6 地址  : ${GREEN}${ipv6}${RESET}"
     
-    # 强制走 IPv4 接口请求 API，防止 IPv6 刚开启不稳定导致卡死
     local api_url="http://ip-api.com/json/${ipv6}?fields=country,regionName,city,isp,org,as,hosting"
     local ip_info
     ip_info=$(curl -s -4 --max-time 5 "$api_url")
     
     if [[ -n "$ip_info" ]]; then
-        # 解析 JSON 字段
         local country=$(echo "$ip_info" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
         local city=$(echo "$ip_info" | grep -o '"city":"[^"]*"' | cut -d'"' -f4)
         local isp=$(echo "$ip_info" | grep -o '"isp":"[^"]*"' | cut -d'"' -f4)
@@ -78,7 +96,6 @@ check_status() {
         echo -e "网卡接口层状态  : ${GREEN}已分配 IPv6 (至少具备本地链路地址)${RESET}"
     fi
     
-    # 仅当系统启用了 IPv6 且网卡分配了 inet6 时，才去检测公网 IP，节省查询时间
     if [[ "$status" == "0" ]] && [[ -n "$has_inet6" ]]; then
         check_ipv6_info
     fi
@@ -94,7 +111,11 @@ enable_ipv6() {
     sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
     sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1
     sysctl -p >/dev/null 2>&1
-    echo -e "${GREEN}系统级 IPv6 已成功启用！${RESET}\n"
+    
+    # 触发网络重载以获取 IP
+    reload_network
+
+    echo -e "${GREEN}系统级 IPv6 启用流程完毕！${RESET}\n"
 }
 
 disable_ipv6() {
