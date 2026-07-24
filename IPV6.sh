@@ -42,32 +42,33 @@ fetch_ip_details() {
     fi
     echo -e "公网 IP 地址   : ${GREEN}${ip}${RESET}"
     
-    # 极速调用专业商业接口，直接分离 Geo(使用地) 和 Whois(注册地)
-    local api_url="https://api.ipapi.is/?q=${ip}"
-    local ip_data
+    # 彻底抛弃易被限流的单一接口，组合使用 ip-api(Geo) 和 ipinfo(Whois)
+    local geo_api="http://ip-api.com/json/${ip}?fields=country,countryCode,isp,org,as,hosting"
+    local whois_api="https://ipinfo.io/${ip}/json"
     
-    if [[ "$version" == "4" ]]; then
-        ip_data=$(curl -s -4 --max-time 3 "$api_url")
-    else
-        ip_data=$(curl -s -6 --max-time 3 "$api_url")
-    fi
+    local geo_data=$(curl -s -4 --max-time 3 "$geo_api")
+    local whois_data=$(curl -s -4 --max-time 3 "$whois_api")
     
-    if [[ -z "$ip_data" || "$ip_data" == *"error"* ]]; then
-        echo -e "${RED}数据查询超时或被限流，无法获取详细归属地。${RESET}"
+    if [[ -z "$geo_data" && -z "$whois_data" ]]; then
+        echo -e "${RED}数据查询超时或被网络拦截，无法获取详细归属地。${RESET}"
         return
     fi
 
-    # 轻量级文本解析，摆脱依赖
-    local usage_code=$(echo "$ip_data" | grep -A 5 '"location":' | grep -o '"country_code": "[^"]*"' | cut -d'"' -f4 | head -n 1)
-    local usage_country=$(echo "$ip_data" | grep -A 5 '"location":' | grep -o '"country": "[^"]*"' | cut -d'"' -f4 | head -n 1)
-    
-    local reg_code=$(echo "$ip_data" | grep -A 5 '"asn":' | grep -o '"country": "[^"]*"' | cut -d'"' -f4 | tr '[:lower:]' '[:upper:]' | head -n 1)
-    local asn_num=$(echo "$ip_data" | grep -A 5 '"asn":' | grep -o '"asn": [0-9]*' | cut -d' ' -f2 | head -n 1)
-    local org=$(echo "$ip_data" | grep -A 5 '"company":' | grep -o '"name": "[^"]*"' | cut -d'"' -f4 | head -n 1)
-    local is_dc=$(echo "$ip_data" | grep -o '"is_datacenter": \(true\|false\)' | cut -d' ' -f2 | head -n 1)
+    # 轻量解析 Geo 数据 (ip-api)
+    local usage_code=$(echo "$geo_data" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
+    local usage_country=$(echo "$geo_data" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
+    local asn_info=$(echo "$geo_data" | grep -o '"as":"[^"]*"' | cut -d'"' -f4)
+    local is_dc=$(echo "$geo_data" | grep -o '"hosting":true\|"hosting":false' | cut -d':' -f2)
 
+    # 轻量解析 Whois 数据 (ipinfo)
+    local reg_code=$(echo "$whois_data" | grep -o '"country": "[^"]*"' | cut -d'"' -f4)
+    local org=$(echo "$whois_data" | grep -o '"org": "[^"]*"' | cut -d'"' -f4 | cut -d' ' -f2-)
+
+    # 数据容错互补
+    [[ -z "$usage_code" ]] && usage_code="$reg_code"
     [[ -z "$reg_code" ]] && reg_code="$usage_code"
     [[ -z "$usage_country" ]] && usage_country="$usage_code"
+    [[ -z "$asn_info" ]] && asn_info=$(echo "$whois_data" | grep -o '"org": "[^"]*"' | cut -d'"' -f4)
 
     # 常见地区简易汉化
     [[ "$usage_code" == "CN" ]] && usage_country="中国"
@@ -78,19 +79,19 @@ fetch_ip_details() {
     [[ "$usage_code" == "JP" ]] && usage_country="日本"
     [[ "$usage_code" == "TW" ]] && usage_country="台湾"
 
-    echo -e "自治系统 (ASN) : ${CYAN}AS${asn_num} ${org}${RESET}"
-    echo -e "使用地 (Geo)   : ${CYAN}[${usage_code}] ${usage_country}${RESET}"
-    echo -e "注册地 (Whois) : ${CYAN}[${reg_code}]${RESET}"
+    echo -e "自治系统 (ASN) : ${CYAN}${asn_info:-未知}${RESET}"
+    echo -e "使用地 (Geo)   : ${CYAN}[${usage_code:-未知}] ${usage_country:-未知}${RESET}"
+    echo -e "注册地 (Whois) : ${CYAN}[${reg_code:-未知}]${RESET}"
 
     # 核心判定：使用地与注册地一致即为原生，不一致即为广播
-    if [[ "$usage_code" == "$reg_code" ]]; then
+    if [[ -n "$usage_code" && "$usage_code" == "$reg_code" ]]; then
         echo -e "IP 路由类型    : ${GREEN}原生 IP (Native)${RESET}"
     else
         echo -e "IP 路由类型    : ${RED}广播 IP (Broadcast)${RESET}"
     fi
     
     # 业务属性判定
-    if [[ "$is_dc" == "true" || -n $(echo "$org" | grep -i "cloud\|hosting\|datacenter\|datawave") ]]; then
+    if [[ "$is_dc" == "true" || -n $(echo "${asn_info}${org}" | grep -i "cloud\|hosting\|datacenter\|datawave") ]]; then
         echo -e "IP 业务属性    : ${YELLOW}数据中心 / 机房 (Hosting)${RESET}"
     else
         echo -e "IP 业务属性    : ${GREEN}住宅 / 商业宽带 (Residential/ISP)${RESET}"
