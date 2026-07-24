@@ -15,8 +15,6 @@ fi
 # ================== 网络重载模块 ==================
 reload_network() {
     echo -e "${YELLOW}--> 正在尝试重载网络服务以触发 IPv6 地址分配...${RESET}"
-    
-    # 按照常见优先级检测并重启网络服务
     if command -v netplan >/dev/null 2>&1; then
         netplan apply >/dev/null 2>&1
     elif systemctl is-active --quiet systemd-networkd; then
@@ -26,54 +24,71 @@ reload_network() {
     elif systemctl is-active --quiet NetworkManager; then
         systemctl restart NetworkManager >/dev/null 2>&1
     else
-        echo -e "${YELLOW}未检测到标准网络重载工具，如果未获取到 IPv6，可能需要手动执行 systemctl restart network${RESET}"
+        echo -e "${YELLOW}未检测到标准网络重载工具，如果未获取到 IPv6，请手动执行网络重启命令${RESET}"
     fi
-    
-    # 给系统留出 4 秒钟的时间完成 SLAAC 或 DHCPv6 协商
     echo -e "正在等待网卡完成 IP 协商 (约 4 秒)..."
     sleep 4
 }
 
-# ================== IP 详情检测 ==================
-check_ipv6_info() {
-    echo -e "${CYAN}---------------------------------------------------------${RESET}"
-    echo -en "正在检测公网 IPv6 详情 (请稍候)...\r"
-    
-    local ipv6
-    ipv6=$(curl -s -6 --max-time 3 http://icanhazip.com || curl -s -6 --max-time 3 http://ifconfig.co/ip)
-    
-    # 清除上一行的提示
-    echo -e "\033[2K\r\c"
+# ================== IP 详情检测 (双栈) ==================
+check_ip_info() {
+    local version=$1
+    local ip
 
-    if [[ -z "$ipv6" ]]; then
-        echo -e "公网 IPv6 状态  : ${YELLOW}未检测到公网 IPv6 (需确保云控制台已分配或路由通畅)${RESET}"
+    if [[ "$version" == "4" ]]; then
+        echo -e "\n${CYAN}--- IPv4 网络状态 ---${RESET}"
+        ip=$(curl -s -4 --max-time 3 http://icanhazip.com || curl -s -4 --max-time 3 http://ifconfig.me/ip)
+    else
+        echo -e "\n${CYAN}--- IPv6 网络状态 ---${RESET}"
+        ip=$(curl -s -6 --max-time 3 http://icanhazip.com || curl -s -6 --max-time 3 http://ifconfig.co/ip)
+    fi
+
+    if [[ -z "$ip" ]]; then
+        echo -e "公网状态       : ${YELLOW}未检测到可用公网 IPv${version} 地址${RESET}"
         return
     fi
 
-    echo -e "公网 IPv6 地址  : ${GREEN}${ipv6}${RESET}"
+    echo -e "公网 IP 地址   : ${GREEN}${ip}${RESET}"
+
+    # 请求 ip-api.com 获取 Geo 使用地及 ASN (强制用 v4 请求避免路由未通卡死)
+    local geo_api="http://ip-api.com/json/${ip}?fields=country,countryCode,city,isp,org,as,hosting"
+    local geo_res=$(curl -s -4 --max-time 5 "$geo_api")
     
-    local api_url="http://ip-api.com/json/${ipv6}?fields=country,regionName,city,isp,org,as,hosting"
-    local ip_info
-    ip_info=$(curl -s -4 --max-time 5 "$api_url")
-    
-    if [[ -n "$ip_info" ]]; then
-        local country=$(echo "$ip_info" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
-        local city=$(echo "$ip_info" | grep -o '"city":"[^"]*"' | cut -d'"' -f4)
-        local isp=$(echo "$ip_info" | grep -o '"isp":"[^"]*"' | cut -d'"' -f4)
-        local as_info=$(echo "$ip_info" | grep -o '"as":"[^"]*"' | cut -d'"' -f4)
-        local hosting=$(echo "$ip_info" | grep -o '"hosting":true\|"hosting":false' | cut -d':' -f2)
-        
-        echo -e "注册/使用地区   : ${CYAN}${country} - ${city}${RESET}"
-        echo -e "运营商 (ISP)    : ${CYAN}${isp}${RESET}"
-        echo -e "ASN 归属        : ${CYAN}${as_info}${RESET}"
-        
-        if [[ "$hosting" == "false" ]]; then
-            echo -e "IP 纯净度评估   : ${GREEN}原生 IP (住宅宽带 / 商业 ISP 直连)${RESET}"
+    # 请求 ipinfo.io 获取 Whois 注册地
+    local whois_api="https://ipinfo.io/${ip}/json"
+    local whois_res=$(curl -s -4 --max-time 5 "$whois_api")
+
+    if [[ -n "$geo_res" ]]; then
+        local usage_country=$(echo "$geo_res" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
+        local usage_code=$(echo "$geo_res" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
+        local isp=$(echo "$geo_res" | grep -o '"isp":"[^"]*"' | cut -d'"' -f4)
+        local as_info=$(echo "$geo_res" | grep -o '"as":"[^"]*"' | cut -d'"' -f4)
+        local hosting=$(echo "$geo_res" | grep -o '"hosting":true\|"hosting":false' | cut -d':' -f2)
+
+        local reg_code=$(echo "$whois_res" | grep -o '"country": "[^"]*"' | cut -d'"' -f4)
+        # 如果获取失败则 fallback 回使用地代码
+        [[ -z "$reg_code" ]] && reg_code="$usage_code"
+
+        echo -e "自治系统 (ASN) : ${CYAN}${as_info}${RESET}"
+        echo -e "组织 / ISP     : ${CYAN}${isp}${RESET}"
+        echo -e "使用地 (Geo)   : ${CYAN}[${usage_code}] ${usage_country}${RESET}"
+        echo -e "注册地 (Whois) : ${CYAN}[${reg_code}]${RESET}"
+
+        # 核心逻辑：如果使用地与注册地一致为原生，不一致为广播
+        if [[ "$usage_code" == "$reg_code" ]]; then
+            echo -e "IP 路由类型    : ${GREEN}原生 IP (Native)${RESET}"
         else
-            echo -e "IP 纯净度评估   : ${YELLOW}非原生 IP (数据中心 / 机房 / 广播 IP)${RESET}"
+            echo -e "IP 路由类型    : ${RED}广播 IP (Broadcast)${RESET}"
+        fi
+        
+        # 补充：机房与家用宽带区分
+        if [[ "$hosting" == "true" ]]; then
+            echo -e "IP 业务属性    : ${YELLOW}数据中心/机房 (Hosting)${RESET}"
+        else
+            echo -e "IP 业务属性    : ${GREEN}住宅/商业宽带 (Residential/ISP)${RESET}"
         fi
     else
-        echo -e "IP 纯净度评估   : ${RED}请求超时，无法获取详细归属地信息。${RESET}"
+        echo -e "${RED}无法获取归属地详情，API 请求超时或限流。${RESET}"
     fi
 }
 
@@ -81,6 +96,10 @@ check_ipv6_info() {
 check_status() {
     local status=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
     local has_inet6=$(ip a | grep -w inet6)
+
+    echo -e "${CYAN}=========================================================${RESET}"
+    echo -e "${CYAN}                 系统级 IPv6 管理工具                    ${RESET}"
+    echo -e "${CYAN}=========================================================${RESET}"
 
     if [[ "$status" == "1" ]]; then
         echo -e "内核 sysctl 状态: ${RED}已禁用 IPv6${RESET}"
@@ -93,12 +112,17 @@ check_status() {
     if [[ -z "$has_inet6" ]]; then
         echo -e "网卡接口层状态  : ${RED}未挂载 IPv6 协议栈${RESET}"
     else
-        echo -e "网卡接口层状态  : ${GREEN}已分配 IPv6 (至少具备本地链路地址)${RESET}"
+        echo -e "网卡接口层状态  : ${GREEN}已分配 IPv6 栈 (至少具备 fe80 本地链路)${RESET}"
     fi
     
+    # 无论 IPv6 状态如何，始终显示 IPv4
+    check_ip_info "4"
+    
+    # 仅当系统启用了 IPv6 且网卡挂载了协议栈时，检测 IPv6
     if [[ "$status" == "0" ]] && [[ -n "$has_inet6" ]]; then
-        check_ipv6_info
+        check_ip_info "6"
     fi
+    echo -e "${CYAN}=========================================================${RESET}"
 }
 
 # ================== 核心功能 ==================
@@ -112,9 +136,7 @@ enable_ipv6() {
     sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1
     sysctl -p >/dev/null 2>&1
     
-    # 触发网络重载以获取 IP
     reload_network
-
     echo -e "${GREEN}系统级 IPv6 启用流程完毕！${RESET}\n"
 }
 
@@ -141,11 +163,7 @@ EOF
 # ================== 交互菜单 ==================
 while true; do
     clear
-    echo -e "${CYAN}=========================================================${RESET}"
-    echo -e "${CYAN}                 系统级 IPv6 管理工具                    ${RESET}"
-    echo -e "${CYAN}=========================================================${RESET}"
     check_status
-    echo -e "${CYAN}=========================================================${RESET}"
     echo "  1. 启用 IPv6 (Enable)"
     echo "  2. 禁用 IPv6 (Disable)"
     echo "  0. 退出脚本"
